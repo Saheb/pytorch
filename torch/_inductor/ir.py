@@ -6973,18 +6973,24 @@ class ExternKernel(InputsKernel):
             )
 
     def codegen_alignment_asserts(self, wrapper: PythonWrapperCodegen) -> None:
-        if config.alignment_asserts and not V.graph.cpp_wrapper:
-            name = self.get_name()
-            aligned = name not in V.graph.unaligned_buffers
-            op_name = self.get_op_name()
-            if aligned:
+        if not config.alignment_asserts or config.aot_inductor.allow_stack_allocation:
+            return
+        name = self.get_name()
+        aligned = name not in V.graph.unaligned_buffers
+        op_name = self.get_op_name()
+        if aligned:
+            if V.graph.cpp_wrapper:
                 wrapper.writeline(
-                    f"assert_alignment({name}, {GPU_ALIGN_BYTES}, {op_name!r})"
+                    f'assert_alignment({name}, {GPU_ALIGN_BYTES}, "{op_name}");'
                 )
             else:
                 wrapper.writeline(
-                    f"# buffer {name} (op: {op_name}) is assumed to be not aligned"
+                    f"assert_alignment({name}, {GPU_ALIGN_BYTES}, {op_name!r})"
                 )
+        else:
+            wrapper.writeline(
+                f"{wrapper.comment} buffer {name} (op: {op_name}) is assumed to be not aligned"
+            )
 
     def codegen_memory_tracking(self, wrapper: PythonWrapperCodegen) -> None:
         """
