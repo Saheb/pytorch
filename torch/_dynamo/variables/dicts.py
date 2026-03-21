@@ -884,20 +884,6 @@ class ConstDictVariable(VariableTracker):
             key = Hashable(args[0])
             self.items.move_to_end(key, last=last)
             return CONSTANT_VARIABLE_NONE
-        elif name == "__eq__" and istype(
-            self, ConstDictVariable
-        ):  # don't let Set use this function
-            if len(args) != 1:
-                raise_args_mismatch(tx, name, "1 args", f"{len(args)} args")
-
-            return SourcelessBuilder.create(tx, polyfills.dict___eq__).call_function(
-                tx, [self, args[0]], {}
-            )
-        elif name == "__ne__":
-            return VariableTracker.build(
-                tx,
-                not self.call_method(tx, "__eq__", args, kwargs).value,  # type: ignore[attr-defined]
-            )
         elif name == "__or__":
             if len(args) != 1:
                 raise_args_mismatch(tx, name, "1 args", f"{len(args)} args")
@@ -1011,6 +997,34 @@ class ConstDictVariable(VariableTracker):
         Dictionaries are mutable and therefore not hashable in Python.
         """
         return False
+
+    def richcompare_impl(
+        self,
+        tx: "InstructionTranslator",
+        other: VariableTracker,
+        op: str,
+    ) -> VariableTracker:
+        # CPython: dict_richcompare in Objects/dictobject.c
+        # https://github.com/python/cpython/blob/main/Objects/dictobject.c
+        from .builder import SourcelessBuilder
+
+        if op in ("__eq__", "__ne__"):
+            try:
+                other_type = other.python_type()
+            except NotImplementedError:
+                return ConstantVariable.create(NotImplemented)
+            if not issubclass(other_type, dict):
+                return ConstantVariable.create(NotImplemented)
+            result = SourcelessBuilder.create(tx, polyfills.dict___eq__).call_function(
+                tx, [self, other], {}
+            )
+            if op == "__ne__":
+                try:
+                    return ConstantVariable.create(not result.as_python_constant())
+                except NotImplementedError:
+                    return ConstantVariable.create(NotImplemented)
+            return result
+        return ConstantVariable.create(NotImplemented)
 
 
 class MappingProxyVariable(VariableTracker):
@@ -1175,13 +1189,6 @@ class DefaultDictVariable(ConstDictVariable):
                 self.default_factory = args[1]
                 return CONSTANT_VARIABLE_NONE
             return super().call_method(tx, name, args, kwargs)
-        elif name == "__eq__":
-            if len(args) != 1:
-                raise_args_mismatch(tx, name, "1 args", f"{len(args)} args")
-
-            return VariableTracker.build(tx, polyfills.dict___eq__).call_function(
-                tx, [self, args[0]], {}
-            )
         else:
             return super().call_method(tx, name, args, kwargs)
 
@@ -1516,19 +1523,31 @@ class SetVariable(ConstDictVariable):
             assert m is not None
             self.call_method(tx, m, args, kwargs)
             return self
-        elif name == "__eq__":
-            if not isinstance(args[0], (SetVariable, variables.UserDefinedSetVariable)):
-                return CONSTANT_VARIABLE_FALSE
-            r = self.call_method(tx, "symmetric_difference", args, kwargs)
-            return VariableTracker.build(tx, len(r.set_items) == 0)  # type: ignore[attr-defined]
-        elif name in cmp_name_to_op_mapping:
-            if not isinstance(args[0], (SetVariable, variables.UserDefinedSetVariable)):
-                return VariableTracker.build(tx, NotImplemented)
-            return VariableTracker.build(
-                tx,
-                cmp_name_to_op_mapping[name](self.set_items, args[0].set_items),  # type: ignore[attr-defined]
-            )
         return super().call_method(tx, name, args, kwargs)
+
+    def richcompare_impl(
+        self,
+        tx: "InstructionTranslator",
+        other: VariableTracker,
+        op: str,
+    ) -> VariableTracker:
+        # CPython: set_richcompare in Objects/setobject.c
+        # https://github.com/python/cpython/blob/main/Objects/setobject.c
+        #
+        # No polyfill needed: set_items is a concrete frozenset of VTs resolved
+        # at trace time, so we can operate on it directly without tracing any
+        # runtime iteration. This differs from list/dict comparison where the
+        # elements must be compared at runtime via polyfills.list_cmp /
+        # polyfills.dict___eq__.
+        if not isinstance(other, (SetVariable, variables.UserDefinedSetVariable)):
+            return ConstantVariable.create(NotImplemented)
+        if op == "__eq__":
+            r = self.call_method(tx, "symmetric_difference", [other], {})
+            return VariableTracker.build(tx, len(r.set_items) == 0)  # type: ignore[attr-defined]
+        return VariableTracker.build(
+            tx,
+            cmp_name_to_op_mapping[op](self.set_items, other.set_items),  # type: ignore[attr-defined]
+        )
 
     def python_type_var(self) -> "BuiltinVariable":
         return variables.BuiltinVariable(set)
@@ -1888,14 +1907,29 @@ class DictKeysVariable(DictViewVariable):
             m = getattr(self.set_items, name)
             r = m(args[0].set_items)  # type: ignore[attr-defined]
             return SetVariable(r)
-        if name in cmp_name_to_op_mapping:
-            if not isinstance(args[0], (SetVariable, DictKeysVariable)):
-                return VariableTracker.build(tx, NotImplemented)
-            return VariableTracker.build(
-                tx,
-                cmp_name_to_op_mapping[name](self.set_items, args[0].set_items),  # type: ignore[attr-defined]
-            )
         return super().call_method(tx, name, args, kwargs)
+
+    def richcompare_impl(
+        self,
+        tx: "InstructionTranslator",
+        other: VariableTracker,
+        op: str,
+    ) -> VariableTracker:
+        # CPython: dictviews_richcompare in Objects/dictobject.c
+        # https://github.com/python/cpython/blob/main/Objects/dictobject.c
+        #
+        # Belongs on DictKeysVariable (not DictViewVariable) because:
+        # - DictValuesVariable is explicitly not comparable
+        # - DictItemsVariable has its own richcompare_impl with different semantics
+        #
+        # SetVariable is included because CPython uses PyAnySet_Check(other),
+        # which accepts set/frozenset. In Python: {1:2}.keys() == {1} → True.
+        if not isinstance(other, (SetVariable, DictKeysVariable)):
+            return ConstantVariable.create(NotImplemented)
+        return VariableTracker.build(
+            tx,
+            cmp_name_to_op_mapping[op](self.set_items, other.set_items),  # type: ignore[attr-defined]
+        )
 
 
 class DictValuesVariable(DictViewVariable):
@@ -1951,21 +1985,27 @@ class DictItemsVariable(DictViewVariable):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
-        # TODO(guilhermeleobas): This should actually check if args[0]
-        # implements the mapping protocol.
-        if name == "__eq__":
-            if len(args) != 1:
-                raise_args_mismatch(tx, name, "1 args", f"{len(args)} args")
-            if isinstance(args[0], DictItemsVariable):
-                return self.dv_dict.call_method(tx, "__eq__", [args[0].dv_dict], {})
-            return CONSTANT_VARIABLE_FALSE
-        elif name == "__iter__":
+        if name == "__iter__":
             from .lists import ListIteratorVariable
 
             return ListIteratorVariable(
                 self.view_items_vt, mutation_type=ValueMutationNew()
             )
         return super().call_method(tx, name, args, kwargs)
+
+    def richcompare_impl(
+        self,
+        tx: "InstructionTranslator",
+        other: VariableTracker,
+        op: str,
+    ) -> VariableTracker:
+        # CPython: dictviews_richcompare in Objects/dictobject.c
+        # https://github.com/python/cpython/blob/main/Objects/dictobject.c
+        if op == "__eq__":
+            if isinstance(other, DictItemsVariable):
+                return self.dv_dict.richcompare_impl(tx, other.dv_dict, "__eq__")
+            return ConstantVariable.create(NotImplemented)
+        return ConstantVariable.create(NotImplemented)
 
     def is_python_hashable(self) -> Literal[False]:
         """
